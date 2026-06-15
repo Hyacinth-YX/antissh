@@ -28,6 +28,8 @@ GRAFTCP_RUNTIME_MODE="" # merged=v0.8+ 单二进制；legacy=v0.7 graftcp + graf
 GRAFTCP_BIN=""          # 实际用于执行命令的 graftcp 可执行文件
 GRAFTCP_LOCAL_BIN=""    # legacy 模式下的 graftcp-local 可执行文件
 TARGET_BINS=()  # 需配置代理的 language_server_* 路径列表（兼容多版本共存）
+AGY_CLI_BINS=() # 需配置代理的 Antigravity CLI（agy）可执行文件路径列表
+CONFIG_TARGET="ide" # 配置对象：ide=IDE language_server / cli=agy 命令行 / both=两者
 GRAFTCP_LOCAL_PORT=""  # graftcp-local 监听端口（默认 2233）
 GRAFTCP_PIPE_PATH=""   # graftcp-local FIFO 路径（多实例支持）
 FORCE_SYSTEM_DNS="1"   # 默认强制使用系统 DNS（可选开关）
@@ -478,7 +480,7 @@ echo "    - 官网: https://www.proxifier.com/"
 echo "    - 关于license key，请自行搜索，有特别版序列号，如有能力请支持正版"
 echo "    - 支持按应用配置代理规则"
 echo "    - 设置方法: Proxifier -> Profile -> Proxy Servers -> Add 添加代理服务器"
-echo "      然后在 Rules 中应用程序中添加 com.google.antigravity.helper; com.google.antigravity; Antigravity; language_server_macos_arm; language_server_macos_x64"
+echo "      然后在 Rules 中应用程序中添加 com.google.antigravity.helper; com.google.antigravity; Antigravity; language_server_macos_arm; language_server_macos_x64; agy"
 echo ""
 echo " 2. Clash / Surge 等 TUN 模式"
 echo "    - 开启 TUN 模式后可全局透明代理"
@@ -507,6 +509,43 @@ check_macos_version
 error "当前系统 ${os} 不在支持列表，仅支持 Linux。macOS/Windows 用户请使用 Proxifier 应用或 TUN 模式。"
 ;;
 esac
+}
+
+################################ 配置对象选择 ################################
+
+# 询问用户要为哪个对象配置代理
+# 设置全局变量 CONFIG_TARGET（ide / cli / both）
+ask_config_target() {
+local choice=""
+
+echo ""
+echo "============================================="
+echo " 选择要配置代理的对象"
+echo "============================================="
+echo "  1) Antigravity IDE 远程 Agent（language_server）[默认]"
+echo "  2) Antigravity CLI（agy 命令行）"
+echo "  3) 两者都配置"
+echo ""
+read -r -p "请选择 [1/2/3]（默认 1）: " choice
+choice="${choice:-1}"
+
+case "${choice}" in
+1)
+CONFIG_TARGET="ide"
+;;
+2)
+CONFIG_TARGET="cli"
+;;
+3)
+CONFIG_TARGET="both"
+;;
+*)
+echo "无效选择，使用默认（IDE）。"
+CONFIG_TARGET="ide"
+;;
+esac
+
+log "配置对象：${CONFIG_TARGET}"
 }
 
 ################################ 代理解析与校验 ################################
@@ -1606,6 +1645,7 @@ log "graftcp 运行模式：$(describe_graftcp_runtime)"
 # 设置变量：TARGET_BINS（数组，多版本共存时含多个待配置文件）
 # 错误处理：未找到时调用 error() 退出
 find_language_server() {
+local required="${1:-true}"
 local pattern base current_user
 pattern="language_server_linux_"
 
@@ -1687,6 +1727,10 @@ fi
 done
 
 if [ "${#candidates[@]}" -eq 0 ]; then
+if [ "${required}" != "true" ]; then
+warn "未找到 language_server，跳过 IDE Agent 配置。"
+return 1
+fi
 echo ""
 echo "未在以下位置找到 language_server_* 文件："
 for base in "${search_paths[@]}"; do
@@ -1756,6 +1800,10 @@ fi
       done
 
       if [ "${#accessible_candidates[@]}" -eq 0 ]; then
+        if [ "${required}" != "true" ]; then
+          warn "检测到其他用户的 language_server 但当前用户无权限修改，跳过 IDE Agent 配置。"
+          return 1
+        fi
         echo ""
         echo "❌ 检测到 ${#other_candidates[@]} 个其他用户的 language_server，但当前用户无权限修改："
         for p in "${other_candidates[@]}"; do
@@ -1783,9 +1831,122 @@ fi
     fi
 
     if [ "${#TARGET_BINS[@]}" -eq 0 ]; then
+      if [ "${required}" != "true" ]; then
+        warn "自动选择 language_server 失败，跳过 IDE Agent 配置。"
+        return 1
+      fi
       error "自动选择 Agent 服务失败，请检查文件权限。"
     fi
   fi
+}
+
+################################ 查找 Antigravity CLI（agy） ################################
+
+# 函数名：find_agy_cli
+# 功能：查找 Antigravity CLI（agy）可执行文件
+#       agy 是自带代理需求的 Go 单二进制（与 IDE 共用同一 Agent 引擎），
+#       默认安装在 ~/.local/bin/agy，可直接用 graftcp wrapper 代理其出站流量。
+# 参数：$1 - required（true/false），默认 true；false 时未找到不报错，返回 1
+# 设置变量：AGY_CLI_BINS（数组）
+# 返回：0 找到并设置 / 1 未找到（仅 required=false）
+find_agy_cli() {
+local required="${1:-true}"
+local current_user f real in_path manual user_dir
+current_user="$(whoami)"
+
+log "开始查找 Antigravity CLI（agy）..."
+
+local candidates=()
+declare -A seen_paths
+
+# 构建候选可执行文件列表（按优先级）
+local search_files=()
+# 1. 当前用户默认安装位置
+search_files+=("${HOME}/.local/bin/agy")
+# 2. PATH 中的 agy（首次运行后可能已是 wrapper，仍可复用）
+in_path="$(command -v agy 2>/dev/null || true)"
+[ -n "${in_path}" ] && search_files+=("${in_path}")
+# 3. root（sudo 场景）
+if [ "${HOME}" != "/root" ] && [ -e "/root/.local/bin/agy" ]; then
+search_files+=("/root/.local/bin/agy")
+fi
+# 4. /home 下的其他用户（WSL / 多用户场景）
+if [ -d "/home" ]; then
+for user_dir in /home/*; do
+[ "${user_dir}" = "${HOME}" ] && continue
+[ -e "${user_dir}/.local/bin/agy" ] && search_files+=("${user_dir}/.local/bin/agy")
+done
+fi
+
+for f in "${search_files[@]}"; do
+# 跳过 .bak 备份文件
+[[ "${f}" == *.bak ]] && continue
+# 必须存在且为普通文件（-f 会跟随符号链接）
+[ -f "${f}" ] || continue
+# 按 realpath 去重，避免 PATH 入口与默认位置指向同一文件被重复配置
+real="$(readlink -f "${f}" 2>/dev/null || echo "${f}")"
+if [ -z "${seen_paths[${real}]:-}" ]; then
+seen_paths["${real}"]=1
+candidates+=("${f}")
+log "  找到：${f}"
+fi
+done
+
+if [ "${#candidates[@]}" -eq 0 ]; then
+if [ "${required}" != "true" ]; then
+warn "未找到 Antigravity CLI（agy），跳过 CLI 配置。"
+return 1
+fi
+echo ""
+echo "未找到 Antigravity CLI（agy）可执行文件。"
+echo "默认安装位置：${HOME}/.local/bin/agy"
+echo "如未安装，可参考官方安装命令："
+echo "  curl -fsSL https://antigravity.google/cli/install.sh | bash"
+echo ""
+read -r -p "请手动输入 agy 可执行文件完整路径（直接回车放弃）: " manual
+if [ -n "${manual}" ] && [ -f "${manual}" ] && [[ "${manual}" != *.bak ]]; then
+candidates+=("${manual}")
+else
+error "未找到 Antigravity CLI（agy），请确认安装后重试。"
+fi
+fi
+
+# 多用户：优先当前用户 HOME 下的候选
+local user_candidates=() other_candidates=()
+for f in "${candidates[@]}"; do
+if [[ "${f}" == "${HOME}/"* ]]; then
+user_candidates+=("${f}")
+else
+other_candidates+=("${f}")
+fi
+done
+
+AGY_CLI_BINS=()
+if [ "${#user_candidates[@]}" -gt 0 ]; then
+# 当前用户通常只有一个 agy
+AGY_CLI_BINS+=("${user_candidates[0]}")
+else
+# 借用其他用户的文件（需当前用户对其有读权限、对所在目录有写权限）
+for f in "${other_candidates[@]}"; do
+if [ -r "${f}" ] && [ -w "$(dirname "${f}")" ]; then
+AGY_CLI_BINS+=("${f}")
+break
+fi
+done
+if [ "${#AGY_CLI_BINS[@]}" -eq 0 ]; then
+if [ "${required}" != "true" ]; then
+warn "检测到 agy 但当前用户无权限修改，跳过 CLI 配置。"
+return 1
+fi
+error "检测到 Antigravity CLI（agy）但当前用户无权限修改，请确认其安装在当前用户目录。"
+fi
+warn "将使用其他用户的 agy（请确认这是您期望的行为）：${AGY_CLI_BINS[0]}"
+fi
+
+for f in "${AGY_CLI_BINS[@]}"; do
+log "将配置 Antigravity CLI：${f}"
+done
+return 0
 }
 
 ################################ 写入 wrapper ################################
@@ -1947,7 +2108,7 @@ TEMP_FILES_TO_CLEANUP+=("${wrapper_tmp}")
 cat > "${wrapper_tmp}" <<EOF
 #!/usr/bin/env bash
 # 该文件由 antissh.sh 自动生成
-# 用 graftcp 代理启动原始 Antigravity Agent
+# 用 graftcp 代理启动原始 Antigravity Agent / CLI
 
 umask 077
 
@@ -2478,12 +2639,14 @@ fi
 # 功能：脚本主入口，协调所有配置步骤
 main() {
   local target
+  local all_targets=()
   echo "==== Antigravity + graftcp 一键配置脚本 ===="
   echo "支持系统：Linux"
   echo "安装日志：${INSTALL_LOG}"
   echo
 
   check_system
+  ask_config_target
   ask_proxy
   ask_dns_mode
 
@@ -2498,12 +2661,43 @@ main() {
   else
     log "当前 graftcp 为 v0.8+ 单二进制模式，无需配置 graftcp-local 端口。"
   fi
-  find_language_server
-  preflight_wrapper_targets "${TARGET_BINS[@]}"
+  # 根据配置对象发现待处理目标
+  TARGET_BINS=()
+  AGY_CLI_BINS=()
+  case "${CONFIG_TARGET}" in
+    ide)
+      find_language_server true
+      ;;
+    cli)
+      find_agy_cli true
+      ;;
+    both)
+      find_language_server false || true
+      find_agy_cli false || true
+      ;;
+  esac
+
+  # 合并所有 wrapper 目标（language_server + agy）
   for target in "${TARGET_BINS[@]}"; do
+    all_targets+=("${target}")
+  done
+  for target in "${AGY_CLI_BINS[@]}"; do
+    all_targets+=("${target}")
+  done
+
+  if [ "${#all_targets[@]}" -eq 0 ]; then
+    error "没有可配置的目标：未找到 language_server 或 agy，请确认 Antigravity IDE / CLI 已安装。"
+  fi
+
+  preflight_wrapper_targets "${all_targets[@]}"
+  for target in "${all_targets[@]}"; do
     setup_wrapper "${target}"
   done
-  cleanup_stale_language_servers
+
+  # 仅在配置了 IDE Agent 时清理残留 language_server（CLI 为交互式进程，不主动清理 agy）
+  if [ "${#TARGET_BINS[@]}" -gt 0 ]; then
+    cleanup_stale_language_servers
+  fi
   if [ "${GRAFTCP_RUNTIME_MODE}" = "legacy" ]; then
     cleanup_stale_graftcp_locals "${GRAFTCP_PIPE_PATH}"
   else
@@ -2520,12 +2714,12 @@ main() {
     echo "graftcp-local 端口: ${GRAFTCP_LOCAL_PORT}"
   fi
   echo
-  if [ "${#TARGET_BINS[@]}" -gt 1 ]; then
-    echo "已为以下 ${#TARGET_BINS[@]} 个版本分别配置代理 wrapper（多版本共存）："
+  if [ "${#all_targets[@]}" -gt 1 ]; then
+    echo "已为以下 ${#all_targets[@]} 个目标分别配置代理 wrapper："
   else
     echo "已配置代理 wrapper："
   fi
-  for target in "${TARGET_BINS[@]}"; do
+  for target in "${all_targets[@]}"; do
     echo "  wrapper： ${target}"
     echo "  备份：    ${target}.bak"
   done
@@ -2541,7 +2735,7 @@ main() {
   echo "     将 ANTISSH_FORCE_SYSTEM_DNS 设置为 1（强制）或 0（不强制）。"
   echo
   echo "如需完全恢复原始行为（对每个文件分别执行）："
-  for target in "${TARGET_BINS[@]}"; do
+  for target in "${all_targets[@]}"; do
     echo "  mv \"${target}.bak\" \"${target}\""
   done
   echo
