@@ -2,6 +2,13 @@
 
 为 反重力 Agent 配置代理，解决网络连接问题。
 
+> 支持两种配置对象（脚本启动时可选择）：
+>
+> - **Antigravity IDE 远程 Agent**（`language_server`）
+> - **Antigravity CLI**（`agy` 命令行，默认安装在 `~/.local/bin/agy`）
+>
+> 两者都是与 Antigravity 共用同一 Agent 引擎的 Go 程序，脚本统一通过 graftcp wrapper 代理其出站流量。
+
 ## 系统支持
 
 | 系统        | 支持情况 | 说明                                                                          |
@@ -87,6 +94,10 @@ flowchart TD
 脚本会依次：
 
 - 询问是否需要配置代理
+- 选择配置对象：
+  - `1` Antigravity IDE 远程 Agent（`language_server`，默认）
+  - `2` Antigravity CLI（`agy` 命令行）
+  - `3` 两者都配置
 - 输入代理地址，格式如下：
   - SOCKS5: `socks5://127.0.0.1:10808`
   - HTTP: `http://127.0.0.1:10808`
@@ -95,8 +106,11 @@ flowchart TD
 - 自动识别 graftcp 运行模式：
   - v0.8+：使用官方单二进制 `local/graftcp`，无需配置本地端口
   - v0.7 legacy：配置 `graftcp-local` 监听端口（优先提示上次端口并询问是否复用；无记录时手动输入，默认 2233）
-- 自动查找并配置 language_server
+- 自动查找并配置目标：
+  - IDE：`language_server`（支持多版本共存）
+  - CLI：`agy`（默认 `~/.local/bin/agy`，也会检测 PATH 中的 `agy`）
 - 清理当前用户残留的 language_server 和旧 graftcp-local 进程（v0.8+ 会清理旧的 antissh-managed graftcp-local 实例）
+  - 注意：CLI（`agy`）为交互式进程，脚本不会主动清理正在运行的 `agy`
 
 ### 5. 修改代理
 
@@ -105,7 +119,10 @@ flowchart TD
 ### 6. 恢复原始状态
 
 ```bash
+# IDE Agent
 mv /path/to/language_server_xxx.bak /path/to/language_server_xxx
+# CLI（agy）
+mv ~/.local/bin/agy.bak ~/.local/bin/agy
 ```
 
 路径会在脚本执行完成后显示。
@@ -260,9 +277,12 @@ http://127.0.0.1:10808
    - 填入你的代理地址
 3. 添加规则：`Profile` → `Proxification Rules` → `Add`
    - 应用程序添加以下内容（根据系统选择）：
-     - macOS: `com.google.antigravity.helper; com.google.antigravity; Antigravity; language_server_macos_arm; language_server_macos_x64`
-     - Windows: `language_server_windows_x64.exe; Antigravity.exe`
+     - macOS: `com.google.antigravity.helper; com.google.antigravity; Antigravity; language_server_macos_arm; language_server_macos_x64; agy`
+     - Windows: `language_server_windows_x64.exe; Antigravity.exe; agy.exe`
    - Action 选择刚添加的代理
+
+> [!TIP]
+> 上面的 `agy` / `agy.exe` 对应 Antigravity CLI（命令行）。仅使用 IDE 可忽略；仅使用 CLI 时只需添加 `agy`/`agy.exe` 即可。
 
 ### 推荐方案 2：通过 DLL 注入（仅 Windows 推荐）
 
@@ -313,7 +333,7 @@ chmod +x installAntigravity.sh
 
 ## 依赖要求
 
-- **Go**: >= 1.13（脚本会自动安装）
+- **Go**: >= 1.23（脚本会自动安装）
 - **Git, Make, GCC**（脚本会自动安装）
 
 ## 鸣谢

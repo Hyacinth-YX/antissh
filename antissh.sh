@@ -4,7 +4,7 @@
 # 支持：Linux（macOS 需使用 Proxifier 等替代方案）
 # 作用：
 #   1. 询问是否需要代理，以及代理地址（格式：socks5://ip:port 或 http://ip:port）
-#   2. 自动安装 / 编译 graftcp（Go 项目，使用 Go modules，要求 Go >= 1.13）
+#   2. 自动安装 / 编译 graftcp（Go 项目，使用 Go modules，要求 Go >= 1.23）
 #   3. 自动查找 antigravity 的 language_server_* 可执行文件
 #   4. 备份原二进制为 .bak，并写入 wrapper
 #
@@ -28,6 +28,8 @@ GRAFTCP_RUNTIME_MODE="" # merged=v0.8+ 单二进制；legacy=v0.7 graftcp + graf
 GRAFTCP_BIN=""          # 实际用于执行命令的 graftcp 可执行文件
 GRAFTCP_LOCAL_BIN=""    # legacy 模式下的 graftcp-local 可执行文件
 TARGET_BINS=()  # 需配置代理的 language_server_* 路径列表（兼容多版本共存）
+AGY_CLI_BINS=() # 需配置代理的 Antigravity CLI（agy）可执行文件路径列表
+CONFIG_TARGET="ide" # 配置对象：ide=IDE language_server / cli=agy 命令行 / both=两者
 GRAFTCP_LOCAL_PORT=""  # graftcp-local 监听端口（默认 2233）
 GRAFTCP_PIPE_PATH=""   # graftcp-local FIFO 路径（多实例支持）
 FORCE_SYSTEM_DNS="1"   # 默认强制使用系统 DNS（可选开关）
@@ -478,7 +480,7 @@ echo "    - 官网: https://www.proxifier.com/"
 echo "    - 关于license key，请自行搜索，有特别版序列号，如有能力请支持正版"
 echo "    - 支持按应用配置代理规则"
 echo "    - 设置方法: Proxifier -> Profile -> Proxy Servers -> Add 添加代理服务器"
-echo "      然后在 Rules 中应用程序中添加 com.google.antigravity.helper; com.google.antigravity; Antigravity; language_server_macos_arm; language_server_macos_x64"
+echo "      然后在 Rules 中应用程序中添加 com.google.antigravity.helper; com.google.antigravity; Antigravity; language_server_macos_arm; language_server_macos_x64; agy"
 echo ""
 echo " 2. Clash / Surge 等 TUN 模式"
 echo "    - 开启 TUN 模式后可全局透明代理"
@@ -507,6 +509,43 @@ check_macos_version
 error "当前系统 ${os} 不在支持列表，仅支持 Linux。macOS/Windows 用户请使用 Proxifier 应用或 TUN 模式。"
 ;;
 esac
+}
+
+################################ 配置对象选择 ################################
+
+# 询问用户要为哪个对象配置代理
+# 设置全局变量 CONFIG_TARGET（ide / cli / both）
+ask_config_target() {
+local choice=""
+
+echo ""
+echo "============================================="
+echo " 选择要配置代理的对象"
+echo "============================================="
+echo "  1) Antigravity IDE 远程 Agent（language_server）[默认]"
+echo "  2) Antigravity CLI（agy 命令行）"
+echo "  3) 两者都配置"
+echo ""
+read -r -p "请选择 [1/2/3]（默认 1）: " choice
+choice="${choice:-1}"
+
+case "${choice}" in
+1)
+CONFIG_TARGET="ide"
+;;
+2)
+CONFIG_TARGET="cli"
+;;
+3)
+CONFIG_TARGET="both"
+;;
+*)
+echo "无效选择，使用默认（IDE）。"
+CONFIG_TARGET="ide"
+;;
+esac
+
+log "配置对象：${CONFIG_TARGET}"
 }
 
 ################################ 代理解析与校验 ################################
@@ -1000,63 +1039,54 @@ PM=""
 fi
 }
 
-# 全局变量：是否需要兼容旧版本 Go，兼容模式将移除 toolchain 指令
-NEED_GO_COMPAT="false"
-
 # 函数名：check_go_version
-# 功能：检查 Go 版本是否满足要求（>= 1.13），并处理 toolchain 兼容性
-# 设置变量：NEED_GO_COMPAT (“true” 如果需要兼容模式)
+# 功能：检查 Go 版本是否满足要求（>= 1.23）
 check_go_version() {
 if ! command -v go >/dev/null 2>&1; then
 # 缺 go 的情况交给依赖安装逻辑
 return
 fi
 
-# go version 输出类似：go version go1.22.5 linux/amd64
+# go version 输出类似：go version go1.23.0 linux/amd64
 gv_raw="$(go version 2>/dev/null | awk '{print $3}')"
 gv="${gv_raw#go}"
 major="${gv%%.*}"
 rest="${gv#*.}"
 minor="${rest%%.*}"
 
-# graftcp 使用 Go Modules，要求 Go >= 1.13
-if [ "${major}" -lt 1 ] || { [ "${major}" -eq 1 ] && [ "${minor}" -lt 13 ]; }; then
-error "检测到 Go 版本 ${gv_raw}，过低（要求 >= 1.13），请先升级 Go 后重试。"
-fi
-
-log "Go 版本检查通过：${gv_raw}"
-
-# 检查是否需要升级 Go（< 1.21 时 go.mod 的 toolchain 指令不被支持）
-if [ "${major}" -eq 1 ] && [ "${minor}" -lt 21 ]; then
+# 当前 graftcp 源码要求 Go >= 1.23，并在 Makefile 中强制 GOTOOLCHAIN=local。
+if [ "${major}" -lt 1 ] || { [ "${major}" -eq 1 ] && [ "${minor}" -lt 23 ]; }; then
 echo ""
 echo "============================================="
 echo " 检测到 Go 版本：${gv_raw}"
 echo "============================================="
 echo ""
-echo " graftcp 项目使用了 Go 1.21+ 的 toolchain 指令。"
-echo " 当前版本可以通过兼容模式编译，如果兼容模式编译后 graftcp 运行失败，请升级到 Go 1.21+。"
+echo " 当前 graftcp 源码要求 Go >= 1.23。"
+echo " graftcp 的 Makefile 会设置 GOTOOLCHAIN=local，因此 Go 不会自动下载新工具链。"
 echo ""
 echo " 升级 Go 的影响："
 echo "   ✓ 更好的性能和安全性"
-echo "   ✓ 原生支持新版 go.mod 语法"
+echo "   ✓ 满足当前 graftcp 编译要求"
 echo "   ✗ 注意：可能影响系统上依赖旧版 Go 的其他项目！！！"
 echo ""
-echo " 不升级（兼容模式）："
-echo "   ✓ 不影响现有环境"
-echo "   ✓ 自动移除 go.mod 中的 toolchain 指令后编译"
+echo " 不升级："
+echo "   ✓ 不修改现有环境"
+echo "   ✗ 无法继续编译当前 graftcp"
 echo ""
-read -r -p "是否升级 Go 到最新版本？ [y/N]（默认 N，使用兼容模式）: " upgrade_go
+read -r -p "是否升级 Go 到最新版本？ [y/N]（默认 N，退出）: " upgrade_go
 
 case "${upgrade_go}" in
 [Yy]*)
 upgrade_go_version
+gv_raw="$(go version 2>/dev/null | awk '{print $3}')"
 ;;
 *)
-log "使用兼容模式，将在编译前移除 toolchain 指令。"
-NEED_GO_COMPAT="true"
+error "Go 版本过低（要求 >= 1.23），请升级 Go 后重试。"
 ;;
 esac
 fi
+
+log "Go 版本检查通过：${gv_raw}"
 }
 
 # 升级 Go 到最新稳定版
@@ -1075,9 +1105,7 @@ echo "  1. 使用 root 用户运行此脚本"
 echo "  2. 或安装 sudo 后重试"
 echo "  3. 或手动升级 Go：https://go.dev/doc/install"
 echo ""
-echo "将使用兼容模式继续（不升级 Go）..."
-NEED_GO_COMPAT="true"
-return
+error "升级 Go 需要 root 权限或 sudo，请手动升级到 Go 1.23+ 后重试。"
 fi
 # 测试 sudo 是否可用
 if ! sudo -n true 2>/dev/null; then
@@ -1087,9 +1115,7 @@ echo "   请在接下来的提示中输入密码，或按 Ctrl+C 取消"
 echo ""
 if ! sudo true; then
 echo ""
-echo "❌ 无法获取 sudo 权限，将使用兼容模式继续..."
-NEED_GO_COMPAT="true"
-return
+error "无法获取 sudo 权限，请手动升级到 Go 1.23+ 后重试。"
 fi
 fi
 # sudo 验证通过，设置 UPGRADE_SUDO
@@ -1114,7 +1140,7 @@ latest_version=$(curl -sL "https://go.dev/VERSION?m=text" 2>/dev/null | head -1)
 
 if [ -z "${latest_version}" ]; then
 # 备用方案：使用固定的稳定版本
-latest_version="go1.22.5"
+latest_version="go1.23.0"
 warn "无法获取最新版本，使用备用版本：${latest_version}"
 fi
 
@@ -1167,10 +1193,10 @@ fi
 log "安装 Go 到 /usr/local/go..."
 ${UPGRADE_SUDO} tar -C /usr/local -xzf "${tmp_dir}/${go_tar}"
 
-# 更新 PATH
-if ! echo "${PATH}" | grep -q "/usr/local/go/bin"; then
+# 更新 PATH，确保后续 make 使用刚安装的新版本 Go。
 export PATH="/usr/local/go/bin:${PATH}"
 log "已临时添加 /usr/local/go/bin 到 PATH"
+if ! grep -qs '^[[:space:]]*export PATH=/usr/local/go/bin:\$PATH' "${HOME}/.bashrc" "${HOME}/.profile" 2>/dev/null; then
 echo ""
 echo "⚠️ 提示：请将以下行添加到 ~/.bashrc 或 ~/.profile 以永久生效："
 echo "  export PATH=/usr/local/go/bin:\$PATH"
@@ -1186,7 +1212,6 @@ local new_version
 new_version="$(/usr/local/go/bin/go version 2>/dev/null | awk '{print $3}')"
 log "Go 升级完成：${new_version}"
 
-NEED_GO_COMPAT="false"
 }
 
 # 函数名：ensure_dependencies
@@ -1467,22 +1492,6 @@ else
 GOPROXY_ENV=""
 fi
 
-# 兼容旧版本 Go：删除 go.mod 中的 toolchain 指令
-# 注意：这里修改的是克隆到 ${GRAFTCP_DIR} 的 graftcp 仓库，不是用户的项目
-if [ "${NEED_GO_COMPAT}" = "true" ]; then
-log "兼容模式：移除 ${GRAFTCP_DIR} 中 go.mod 的 toolchain 指令..."
-log "  注：此修改仅影响 graftcp 仓库，不影响您的其他项目"
-for gomod in go.mod local/go.mod; do
-if [ -f "${gomod}" ] && grep -q '^toolchain' "${gomod}"; then
-log "  移除 ${gomod} 中的 toolchain 行"
-sed_inplace '/^toolchain/d' "${gomod}"
-# 2. 修正版本号：将 go 1.23.0 这种格式改为 go 1.23
-sed_inplace 's/^go \([0-9]\+\.[0-9]\+\)\.[0-9]\+/go \1/' "${gomod}"
-log "  已处理 ${gomod}"
-fi
-done
-fi
-
 # 检查并转换不兼容的代理协议
 # 不清除环境变量，而是转换为兼容格式，保持用户代理配置的意图
 local proxy_vars=("ALL_PROXY" "all_proxy" "HTTPS_PROXY" "https_proxy" "HTTP_PROXY" "http_proxy")
@@ -1574,7 +1583,7 @@ echo "=========================================================="
 echo ""
 echo "排查建议："
 echo "  - 检查网络，确保能访问 github.com 或 goproxy.cn"
-echo "  - 升级 Go 到 1.21+：https://go.dev/doc/install"
+echo "  - 升级 Go 到 1.23+：https://go.dev/doc/install"
 echo "  - 查看详细日志：${INSTALL_LOG}"
 echo ""
 # 显示日志最后几行帮助诊断
@@ -1606,6 +1615,7 @@ log "graftcp 运行模式：$(describe_graftcp_runtime)"
 # 设置变量：TARGET_BINS（数组，多版本共存时含多个待配置文件）
 # 错误处理：未找到时调用 error() 退出
 find_language_server() {
+local required="${1:-true}"
 local pattern base current_user
 pattern="language_server_linux_"
 
@@ -1687,6 +1697,10 @@ fi
 done
 
 if [ "${#candidates[@]}" -eq 0 ]; then
+if [ "${required}" != "true" ]; then
+warn "未找到 language_server，跳过 IDE Agent 配置。"
+return 1
+fi
 echo ""
 echo "未在以下位置找到 language_server_* 文件："
 for base in "${search_paths[@]}"; do
@@ -1756,6 +1770,10 @@ fi
       done
 
       if [ "${#accessible_candidates[@]}" -eq 0 ]; then
+        if [ "${required}" != "true" ]; then
+          warn "检测到其他用户的 language_server 但当前用户无权限修改，跳过 IDE Agent 配置。"
+          return 1
+        fi
         echo ""
         echo "❌ 检测到 ${#other_candidates[@]} 个其他用户的 language_server，但当前用户无权限修改："
         for p in "${other_candidates[@]}"; do
@@ -1783,9 +1801,122 @@ fi
     fi
 
     if [ "${#TARGET_BINS[@]}" -eq 0 ]; then
+      if [ "${required}" != "true" ]; then
+        warn "自动选择 language_server 失败，跳过 IDE Agent 配置。"
+        return 1
+      fi
       error "自动选择 Agent 服务失败，请检查文件权限。"
     fi
   fi
+}
+
+################################ 查找 Antigravity CLI（agy） ################################
+
+# 函数名：find_agy_cli
+# 功能：查找 Antigravity CLI（agy）可执行文件
+#       agy 是自带代理需求的 Go 单二进制（与 IDE 共用同一 Agent 引擎），
+#       默认安装在 ~/.local/bin/agy，可直接用 graftcp wrapper 代理其出站流量。
+# 参数：$1 - required（true/false），默认 true；false 时未找到不报错，返回 1
+# 设置变量：AGY_CLI_BINS（数组）
+# 返回：0 找到并设置 / 1 未找到（仅 required=false）
+find_agy_cli() {
+local required="${1:-true}"
+local current_user f real in_path manual user_dir
+current_user="$(whoami)"
+
+log "开始查找 Antigravity CLI（agy）..."
+
+local candidates=()
+declare -A seen_paths
+
+# 构建候选可执行文件列表（按优先级）
+local search_files=()
+# 1. 当前用户默认安装位置
+search_files+=("${HOME}/.local/bin/agy")
+# 2. PATH 中的 agy（首次运行后可能已是 wrapper，仍可复用）
+in_path="$(command -v agy 2>/dev/null || true)"
+[ -n "${in_path}" ] && search_files+=("${in_path}")
+# 3. root（sudo 场景）
+if [ "${HOME}" != "/root" ] && [ -e "/root/.local/bin/agy" ]; then
+search_files+=("/root/.local/bin/agy")
+fi
+# 4. /home 下的其他用户（WSL / 多用户场景）
+if [ -d "/home" ]; then
+for user_dir in /home/*; do
+[ "${user_dir}" = "${HOME}" ] && continue
+[ -e "${user_dir}/.local/bin/agy" ] && search_files+=("${user_dir}/.local/bin/agy")
+done
+fi
+
+for f in "${search_files[@]}"; do
+# 跳过 .bak 备份文件
+[[ "${f}" == *.bak ]] && continue
+# 必须存在且为普通文件（-f 会跟随符号链接）
+[ -f "${f}" ] || continue
+# 按 realpath 去重，避免 PATH 入口与默认位置指向同一文件被重复配置
+real="$(readlink -f "${f}" 2>/dev/null || echo "${f}")"
+if [ -z "${seen_paths[${real}]:-}" ]; then
+seen_paths["${real}"]=1
+candidates+=("${f}")
+log "  找到：${f}"
+fi
+done
+
+if [ "${#candidates[@]}" -eq 0 ]; then
+if [ "${required}" != "true" ]; then
+warn "未找到 Antigravity CLI（agy），跳过 CLI 配置。"
+return 1
+fi
+echo ""
+echo "未找到 Antigravity CLI（agy）可执行文件。"
+echo "默认安装位置：${HOME}/.local/bin/agy"
+echo "如未安装，可参考官方安装命令："
+echo "  curl -fsSL https://antigravity.google/cli/install.sh | bash"
+echo ""
+read -r -p "请手动输入 agy 可执行文件完整路径（直接回车放弃）: " manual
+if [ -n "${manual}" ] && [ -f "${manual}" ] && [[ "${manual}" != *.bak ]]; then
+candidates+=("${manual}")
+else
+error "未找到 Antigravity CLI（agy），请确认安装后重试。"
+fi
+fi
+
+# 多用户：优先当前用户 HOME 下的候选
+local user_candidates=() other_candidates=()
+for f in "${candidates[@]}"; do
+if [[ "${f}" == "${HOME}/"* ]]; then
+user_candidates+=("${f}")
+else
+other_candidates+=("${f}")
+fi
+done
+
+AGY_CLI_BINS=()
+if [ "${#user_candidates[@]}" -gt 0 ]; then
+# 当前用户通常只有一个 agy
+AGY_CLI_BINS+=("${user_candidates[0]}")
+else
+# 借用其他用户的文件（需当前用户对其有读权限、对所在目录有写权限）
+for f in "${other_candidates[@]}"; do
+if [ -r "${f}" ] && [ -w "$(dirname "${f}")" ]; then
+AGY_CLI_BINS+=("${f}")
+break
+fi
+done
+if [ "${#AGY_CLI_BINS[@]}" -eq 0 ]; then
+if [ "${required}" != "true" ]; then
+warn "检测到 agy 但当前用户无权限修改，跳过 CLI 配置。"
+return 1
+fi
+error "检测到 Antigravity CLI（agy）但当前用户无权限修改，请确认其安装在当前用户目录。"
+fi
+warn "将使用其他用户的 agy（请确认这是您期望的行为）：${AGY_CLI_BINS[0]}"
+fi
+
+for f in "${AGY_CLI_BINS[@]}"; do
+log "将配置 Antigravity CLI：${f}"
+done
+return 0
 }
 
 ################################ 写入 wrapper ################################
@@ -1947,7 +2078,7 @@ TEMP_FILES_TO_CLEANUP+=("${wrapper_tmp}")
 cat > "${wrapper_tmp}" <<EOF
 #!/usr/bin/env bash
 # 该文件由 antissh.sh 自动生成
-# 用 graftcp 代理启动原始 Antigravity Agent
+# 用 graftcp 代理启动原始 Antigravity Agent / CLI
 
 umask 077
 
@@ -2018,9 +2149,9 @@ fi
 # 通过 graftcp 启动原始二进制，并清除代理相关环境变量，避免递归代理/死循环
 if [ "\$GRAFTCP_RUNTIME_MODE" = "merged" ]; then
   if [ "\$PROXY_TYPE" = "http" ]; then
-    exec "\$GRAFTCP_BIN" -http_proxy="\$PROXY_URL" -select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
+    exec "\$GRAFTCP_BIN" --http_proxy="\$PROXY_URL" --select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
   else
-    exec "\$GRAFTCP_BIN" -socks5="\$PROXY_URL" -select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
+    exec "\$GRAFTCP_BIN" --socks5="\$PROXY_URL" --select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
   fi
 else
   exec "\$GRAFTCP_BIN" -p "\$GRAFTCP_LOCAL_PORT" -f "\$GRAFTCP_PIPE_PATH" env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
@@ -2194,9 +2325,9 @@ sleep 1
 fi
 
 if [ "${PROXY_TYPE}" = "http" ]; then
-http_code=$("${GRAFTCP_BIN}" -http_proxy="${PROXY_URL}" -select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000")
+http_code=$("${GRAFTCP_BIN}" --http_proxy="${PROXY_URL}" --select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000")
 else
-http_code=$("${GRAFTCP_BIN}" -socks5="${PROXY_URL}" -select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000")
+http_code=$("${GRAFTCP_BIN}" --socks5="${PROXY_URL}" --select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000")
 fi
 
 if [ "${http_code}" = "200" ] || [ "${http_code}" = "301" ] || [ "${http_code}" = "302" ]; then
@@ -2478,12 +2609,14 @@ fi
 # 功能：脚本主入口，协调所有配置步骤
 main() {
   local target
+  local all_targets=()
   echo "==== Antigravity + graftcp 一键配置脚本 ===="
   echo "支持系统：Linux"
   echo "安装日志：${INSTALL_LOG}"
   echo
 
   check_system
+  ask_config_target
   ask_proxy
   ask_dns_mode
 
@@ -2498,12 +2631,43 @@ main() {
   else
     log "当前 graftcp 为 v0.8+ 单二进制模式，无需配置 graftcp-local 端口。"
   fi
-  find_language_server
-  preflight_wrapper_targets "${TARGET_BINS[@]}"
+  # 根据配置对象发现待处理目标
+  TARGET_BINS=()
+  AGY_CLI_BINS=()
+  case "${CONFIG_TARGET}" in
+    ide)
+      find_language_server true
+      ;;
+    cli)
+      find_agy_cli true
+      ;;
+    both)
+      find_language_server false || true
+      find_agy_cli false || true
+      ;;
+  esac
+
+  # 合并所有 wrapper 目标（language_server + agy）
   for target in "${TARGET_BINS[@]}"; do
+    all_targets+=("${target}")
+  done
+  for target in "${AGY_CLI_BINS[@]}"; do
+    all_targets+=("${target}")
+  done
+
+  if [ "${#all_targets[@]}" -eq 0 ]; then
+    error "没有可配置的目标：未找到 language_server 或 agy，请确认 Antigravity IDE / CLI 已安装。"
+  fi
+
+  preflight_wrapper_targets "${all_targets[@]}"
+  for target in "${all_targets[@]}"; do
     setup_wrapper "${target}"
   done
-  cleanup_stale_language_servers
+
+  # 仅在配置了 IDE Agent 时清理残留 language_server（CLI 为交互式进程，不主动清理 agy）
+  if [ "${#TARGET_BINS[@]}" -gt 0 ]; then
+    cleanup_stale_language_servers
+  fi
   if [ "${GRAFTCP_RUNTIME_MODE}" = "legacy" ]; then
     cleanup_stale_graftcp_locals "${GRAFTCP_PIPE_PATH}"
   else
@@ -2520,12 +2684,12 @@ main() {
     echo "graftcp-local 端口: ${GRAFTCP_LOCAL_PORT}"
   fi
   echo
-  if [ "${#TARGET_BINS[@]}" -gt 1 ]; then
-    echo "已为以下 ${#TARGET_BINS[@]} 个版本分别配置代理 wrapper（多版本共存）："
+  if [ "${#all_targets[@]}" -gt 1 ]; then
+    echo "已为以下 ${#all_targets[@]} 个目标分别配置代理 wrapper："
   else
     echo "已配置代理 wrapper："
   fi
-  for target in "${TARGET_BINS[@]}"; do
+  for target in "${all_targets[@]}"; do
     echo "  wrapper： ${target}"
     echo "  备份：    ${target}.bak"
   done
@@ -2541,7 +2705,7 @@ main() {
   echo "     将 ANTISSH_FORCE_SYSTEM_DNS 设置为 1（强制）或 0（不强制）。"
   echo
   echo "如需完全恢复原始行为（对每个文件分别执行）："
-  for target in "${TARGET_BINS[@]}"; do
+  for target in "${all_targets[@]}"; do
     echo "  mv \"${target}.bak\" \"${target}\""
   done
   echo
