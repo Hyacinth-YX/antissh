@@ -333,7 +333,7 @@ chmod +x installAntigravity.sh
 
 ## 依赖要求
 
-- **Go**: >= 1.13（脚本会自动安装）
+- **Go**: >= 1.23（脚本会自动安装）
 - **Git, Make, GCC**（脚本会自动安装）
 
 ## 鸣谢

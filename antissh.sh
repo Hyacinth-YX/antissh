@@ -4,7 +4,7 @@
 # 支持：Linux（macOS 需使用 Proxifier 等替代方案）
 # 作用：
 #   1. 询问是否需要代理，以及代理地址（格式：socks5://ip:port 或 http://ip:port）
-#   2. 自动安装 / 编译 graftcp（Go 项目，使用 Go modules，要求 Go >= 1.13）
+#   2. 自动安装 / 编译 graftcp（Go 项目，使用 Go modules，要求 Go >= 1.23）
 #   3. 自动查找 antigravity 的 language_server_* 可执行文件
 #   4. 备份原二进制为 .bak，并写入 wrapper
 #
@@ -1039,63 +1039,54 @@ PM=""
 fi
 }
 
-# 全局变量：是否需要兼容旧版本 Go，兼容模式将移除 toolchain 指令
-NEED_GO_COMPAT="false"
-
 # 函数名：check_go_version
-# 功能：检查 Go 版本是否满足要求（>= 1.13），并处理 toolchain 兼容性
-# 设置变量：NEED_GO_COMPAT (“true” 如果需要兼容模式)
+# 功能：检查 Go 版本是否满足要求（>= 1.23）
 check_go_version() {
 if ! command -v go >/dev/null 2>&1; then
 # 缺 go 的情况交给依赖安装逻辑
 return
 fi
 
-# go version 输出类似：go version go1.22.5 linux/amd64
+# go version 输出类似：go version go1.23.0 linux/amd64
 gv_raw="$(go version 2>/dev/null | awk '{print $3}')"
 gv="${gv_raw#go}"
 major="${gv%%.*}"
 rest="${gv#*.}"
 minor="${rest%%.*}"
 
-# graftcp 使用 Go Modules，要求 Go >= 1.13
-if [ "${major}" -lt 1 ] || { [ "${major}" -eq 1 ] && [ "${minor}" -lt 13 ]; }; then
-error "检测到 Go 版本 ${gv_raw}，过低（要求 >= 1.13），请先升级 Go 后重试。"
-fi
-
-log "Go 版本检查通过：${gv_raw}"
-
-# 检查是否需要升级 Go（< 1.21 时 go.mod 的 toolchain 指令不被支持）
-if [ "${major}" -eq 1 ] && [ "${minor}" -lt 21 ]; then
+# 当前 graftcp 源码要求 Go >= 1.23，并在 Makefile 中强制 GOTOOLCHAIN=local。
+if [ "${major}" -lt 1 ] || { [ "${major}" -eq 1 ] && [ "${minor}" -lt 23 ]; }; then
 echo ""
 echo "============================================="
 echo " 检测到 Go 版本：${gv_raw}"
 echo "============================================="
 echo ""
-echo " graftcp 项目使用了 Go 1.21+ 的 toolchain 指令。"
-echo " 当前版本可以通过兼容模式编译，如果兼容模式编译后 graftcp 运行失败，请升级到 Go 1.21+。"
+echo " 当前 graftcp 源码要求 Go >= 1.23。"
+echo " graftcp 的 Makefile 会设置 GOTOOLCHAIN=local，因此 Go 不会自动下载新工具链。"
 echo ""
 echo " 升级 Go 的影响："
 echo "   ✓ 更好的性能和安全性"
-echo "   ✓ 原生支持新版 go.mod 语法"
+echo "   ✓ 满足当前 graftcp 编译要求"
 echo "   ✗ 注意：可能影响系统上依赖旧版 Go 的其他项目！！！"
 echo ""
-echo " 不升级（兼容模式）："
-echo "   ✓ 不影响现有环境"
-echo "   ✓ 自动移除 go.mod 中的 toolchain 指令后编译"
+echo " 不升级："
+echo "   ✓ 不修改现有环境"
+echo "   ✗ 无法继续编译当前 graftcp"
 echo ""
-read -r -p "是否升级 Go 到最新版本？ [y/N]（默认 N，使用兼容模式）: " upgrade_go
+read -r -p "是否升级 Go 到最新版本？ [y/N]（默认 N，退出）: " upgrade_go
 
 case "${upgrade_go}" in
 [Yy]*)
 upgrade_go_version
+gv_raw="$(go version 2>/dev/null | awk '{print $3}')"
 ;;
 *)
-log "使用兼容模式，将在编译前移除 toolchain 指令。"
-NEED_GO_COMPAT="true"
+error "Go 版本过低（要求 >= 1.23），请升级 Go 后重试。"
 ;;
 esac
 fi
+
+log "Go 版本检查通过：${gv_raw}"
 }
 
 # 升级 Go 到最新稳定版
@@ -1114,9 +1105,7 @@ echo "  1. 使用 root 用户运行此脚本"
 echo "  2. 或安装 sudo 后重试"
 echo "  3. 或手动升级 Go：https://go.dev/doc/install"
 echo ""
-echo "将使用兼容模式继续（不升级 Go）..."
-NEED_GO_COMPAT="true"
-return
+error "升级 Go 需要 root 权限或 sudo，请手动升级到 Go 1.23+ 后重试。"
 fi
 # 测试 sudo 是否可用
 if ! sudo -n true 2>/dev/null; then
@@ -1126,9 +1115,7 @@ echo "   请在接下来的提示中输入密码，或按 Ctrl+C 取消"
 echo ""
 if ! sudo true; then
 echo ""
-echo "❌ 无法获取 sudo 权限，将使用兼容模式继续..."
-NEED_GO_COMPAT="true"
-return
+error "无法获取 sudo 权限，请手动升级到 Go 1.23+ 后重试。"
 fi
 fi
 # sudo 验证通过，设置 UPGRADE_SUDO
@@ -1153,7 +1140,7 @@ latest_version=$(curl -sL "https://go.dev/VERSION?m=text" 2>/dev/null | head -1)
 
 if [ -z "${latest_version}" ]; then
 # 备用方案：使用固定的稳定版本
-latest_version="go1.22.5"
+latest_version="go1.23.0"
 warn "无法获取最新版本，使用备用版本：${latest_version}"
 fi
 
@@ -1206,10 +1193,10 @@ fi
 log "安装 Go 到 /usr/local/go..."
 ${UPGRADE_SUDO} tar -C /usr/local -xzf "${tmp_dir}/${go_tar}"
 
-# 更新 PATH
-if ! echo "${PATH}" | grep -q "/usr/local/go/bin"; then
+# 更新 PATH，确保后续 make 使用刚安装的新版本 Go。
 export PATH="/usr/local/go/bin:${PATH}"
 log "已临时添加 /usr/local/go/bin 到 PATH"
+if ! grep -qs '^[[:space:]]*export PATH=/usr/local/go/bin:\$PATH' "${HOME}/.bashrc" "${HOME}/.profile" 2>/dev/null; then
 echo ""
 echo "⚠️ 提示：请将以下行添加到 ~/.bashrc 或 ~/.profile 以永久生效："
 echo "  export PATH=/usr/local/go/bin:\$PATH"
@@ -1225,7 +1212,6 @@ local new_version
 new_version="$(/usr/local/go/bin/go version 2>/dev/null | awk '{print $3}')"
 log "Go 升级完成：${new_version}"
 
-NEED_GO_COMPAT="false"
 }
 
 # 函数名：ensure_dependencies
@@ -1506,22 +1492,6 @@ else
 GOPROXY_ENV=""
 fi
 
-# 兼容旧版本 Go：删除 go.mod 中的 toolchain 指令
-# 注意：这里修改的是克隆到 ${GRAFTCP_DIR} 的 graftcp 仓库，不是用户的项目
-if [ "${NEED_GO_COMPAT}" = "true" ]; then
-log "兼容模式：移除 ${GRAFTCP_DIR} 中 go.mod 的 toolchain 指令..."
-log "  注：此修改仅影响 graftcp 仓库，不影响您的其他项目"
-for gomod in go.mod local/go.mod; do
-if [ -f "${gomod}" ] && grep -q '^toolchain' "${gomod}"; then
-log "  移除 ${gomod} 中的 toolchain 行"
-sed_inplace '/^toolchain/d' "${gomod}"
-# 2. 修正版本号：将 go 1.23.0 这种格式改为 go 1.23
-sed_inplace 's/^go \([0-9]\+\.[0-9]\+\)\.[0-9]\+/go \1/' "${gomod}"
-log "  已处理 ${gomod}"
-fi
-done
-fi
-
 # 检查并转换不兼容的代理协议
 # 不清除环境变量，而是转换为兼容格式，保持用户代理配置的意图
 local proxy_vars=("ALL_PROXY" "all_proxy" "HTTPS_PROXY" "https_proxy" "HTTP_PROXY" "http_proxy")
@@ -1613,7 +1583,7 @@ echo "=========================================================="
 echo ""
 echo "排查建议："
 echo "  - 检查网络，确保能访问 github.com 或 goproxy.cn"
-echo "  - 升级 Go 到 1.21+：https://go.dev/doc/install"
+echo "  - 升级 Go 到 1.23+：https://go.dev/doc/install"
 echo "  - 查看详细日志：${INSTALL_LOG}"
 echo ""
 # 显示日志最后几行帮助诊断
@@ -2179,9 +2149,9 @@ fi
 # 通过 graftcp 启动原始二进制，并清除代理相关环境变量，避免递归代理/死循环
 if [ "\$GRAFTCP_RUNTIME_MODE" = "merged" ]; then
   if [ "\$PROXY_TYPE" = "http" ]; then
-    exec "\$GRAFTCP_BIN" -http_proxy="\$PROXY_URL" -select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
+    exec "\$GRAFTCP_BIN" --http_proxy="\$PROXY_URL" --select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
   else
-    exec "\$GRAFTCP_BIN" -socks5="\$PROXY_URL" -select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
+    exec "\$GRAFTCP_BIN" --socks5="\$PROXY_URL" --select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
   fi
 else
   exec "\$GRAFTCP_BIN" -p "\$GRAFTCP_LOCAL_PORT" -f "\$GRAFTCP_PIPE_PATH" env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
@@ -2355,9 +2325,9 @@ sleep 1
 fi
 
 if [ "${PROXY_TYPE}" = "http" ]; then
-http_code=$("${GRAFTCP_BIN}" -http_proxy="${PROXY_URL}" -select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000")
+http_code=$("${GRAFTCP_BIN}" --http_proxy="${PROXY_URL}" --select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000")
 else
-http_code=$("${GRAFTCP_BIN}" -socks5="${PROXY_URL}" -select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000")
+http_code=$("${GRAFTCP_BIN}" --socks5="${PROXY_URL}" --select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000")
 fi
 
 if [ "${http_code}" = "200" ] || [ "${http_code}" = "301" ] || [ "${http_code}" = "302" ]; then
