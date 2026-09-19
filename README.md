@@ -1,3 +1,26 @@
+# Hyacinth-YX 修改版
+
+> Fork 自 [ccpopy/antissh](https://github.com/ccpopy/antissh)。以下为本 fork 的改动，之后保留原项目 README。
+
+## 本版改动
+
+- **进程级代理 DNS**：默认让 Antigravity 使用 Go 内置 DNS，并由新版 graftcp 将 DNS-over-TCP 通过当前 HTTP/SOCKS5 代理转发至 `8.8.8.8:53`。不修改 `/etc/resolv.conf`，不影响其他进程。
+- **可切换和验证**：可回退到系统 DNS；SOCKS5 探测使用代理端解析，并用 `dig` 独立验证代理 DNS（缺少时自动安装）。
+- **避免重复安装 Go**：从 PATH、`/usr/local`、`/usr`、`/opt` 及 asdf/mise/gvm 常见目录中选择最高版本，仅在脚本进程内临时调整 PATH，不修改 `.bashrc`；已有可用 graftcp 时跳过编译依赖检查。
+- **兼容旧版**：graftcp v0.7 legacy 模式不支持代理 DNS，会自动回退到系统 DNS。
+
+运行方式与原版相同：
+
+```bash
+bash ./antissh.sh
+```
+
+生成 wrapper 后，可通过 `ANTISSH_PROXY_DNS=0` 使用系统 DNS，或通过 `ANTISSH_DNS_SERVER=1.1.1.1:53` 更换上游。代理 DNS 要求 graftcp 支持 `--enable-dns` 和 `--dns-server`。
+
+---
+
+## 原项目 README
+
 # 反重力代理配置工具
 
 为 反重力 Agent 配置代理，解决网络连接问题。

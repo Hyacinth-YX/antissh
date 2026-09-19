@@ -27,12 +27,16 @@ GRAFTCP_DIR="${GRAFTCP_DIR:-}" # 保留用户通过环境变量传入的值，�
 GRAFTCP_RUNTIME_MODE="" # merged=v0.8+ 单二进制；legacy=v0.7 graftcp + graftcp-local
 GRAFTCP_BIN=""          # 实际用于执行命令的 graftcp 可执行文件
 GRAFTCP_LOCAL_BIN=""    # legacy 模式下的 graftcp-local 可执行文件
+GO_BIN=""               # 自动选择的 Go 可执行文件（优先最高版本）
+GO_VERSION=""           # 自动选择的 Go 版本（不含 go 前缀）
 TARGET_BINS=()  # 需配置代理的 language_server_* 路径列表（兼容多版本共存）
 AGY_CLI_BINS=() # 需配置代理的 Antigravity CLI（agy）可执行文件路径列表
 CONFIG_TARGET="ide" # 配置对象：ide=IDE language_server / cli=agy 命令行 / both=两者
 GRAFTCP_LOCAL_PORT=""  # graftcp-local 监听端口（默认 2233）
 GRAFTCP_PIPE_PATH=""   # graftcp-local FIFO 路径（多实例支持）
-FORCE_SYSTEM_DNS="1"   # 默认强制使用系统 DNS（可选开关）
+FORCE_SYSTEM_DNS="0"   # 回退到系统 DNS 时是否强制 cgo 解析
+PROXY_DNS_ENABLED="1"  # 默认仅为被 wrapper 启动的进程启用 graftcp 代理 DNS
+GRAFTCP_DNS_SERVER="8.8.8.8:53" # graftcp 经现有代理访问的 DNS-over-TCP 上游
 LAST_PORT_FILE="${INSTALL_ROOT}/last_graftcp_local_port"
 
 # Antigravity 远程 server 根目录名（兼容多版本，按优先级排列）
@@ -929,8 +933,8 @@ log "graftcp-local 将使用端口 ${GRAFTCP_LOCAL_PORT}，FIFO 路径：${GRAFT
 
 ################################ DNS 解析策略 ################################
 
-# 询问用户是否强制使用系统 DNS
-# 设置全局变量 FORCE_SYSTEM_DNS（1=强制，0=不强制）
+# 询问用户使用进程级代理 DNS，还是回退到系统 DNS
+# 设置全局变量 PROXY_DNS_ENABLED / FORCE_SYSTEM_DNS
 ask_dns_mode() {
 local choice=""
 
@@ -938,31 +942,35 @@ echo ""
 echo "============================================="
 echo " DNS 解析策略"
 echo "============================================="
-echo "默认：强制使用系统 DNS（GODEBUG=netdns=cgo）"
+echo "默认：仅为 Antigravity 启用进程级代理 DNS（推荐）"
 echo "说明："
-echo "  - 可减少 Go 内置解析在部分网络的异常"
-echo "  - 但在特殊网络场景，系统 DNS 可能被限制，导致 google 等域名解析失败"
-echo ""
-echo "如果你已配置 smartdns/dnscrypt-proxy 等本地 DNS（如将 /etc/resolv.conf 指向 127.0.0.1）"
-echo "可选择“不强制”，由你自己的 DNS 方案决定解析结果"
-echo "注意：该选项不会自动让 DNS 走代理"
+echo "  - 强制 Go 使用内置 DNS（GODEBUG=netdns=go），绕过系统 nscd 缓存"
+echo "  - graftcp 拦截该进程的 DNS，并通过当前 HTTP/SOCKS5 代理转发"
+echo "  - 不修改 /etc/resolv.conf，不影响服务器上的其他服务，也不需要 sudo"
+echo "  - DNS 上游：${GRAFTCP_DNS_SERVER}（通过代理以 TCP 访问）"
 echo ""
 echo "请选择："
-echo "  - 输入 Y 或直接回车：强制使用系统 DNS（默认）"
-echo "  - 输入 N：不强制系统 DNS（交给用户自定义 DNS 方案）"
+echo "  - 输入 Y 或直接回车：使用进程级代理 DNS（默认）"
+echo "  - 输入 N：使用服务器系统 DNS（可能受本机 DNS 配置影响）"
 read -r -p "请选择 [Y/n]（默认 Y）: " choice
 
 choice="${choice:-Y}"
 case "${choice}" in
 [Nn]*)
-FORCE_SYSTEM_DNS="0"
+PROXY_DNS_ENABLED="0"
+FORCE_SYSTEM_DNS="1"
 ;;
 *)
-FORCE_SYSTEM_DNS="1"
+PROXY_DNS_ENABLED="1"
+FORCE_SYSTEM_DNS="0"
 ;;
 esac
 
-log "DNS 策略：强制系统 DNS=${FORCE_SYSTEM_DNS}"
+if [ "${PROXY_DNS_ENABLED}" = "1" ]; then
+log "DNS 策略：进程级代理 DNS，上游=${GRAFTCP_DNS_SERVER}"
+else
+log "DNS 策略：服务器系统 DNS（GODEBUG=netdns=cgo）"
+fi
 }
 
 ################################ 轻量级代理可用性探测 ################################
@@ -989,8 +997,8 @@ log "正在快速探测代理可用性...（连接超时 3 秒，总超时 5 秒
 local probe_result=1
 
 if [ "${PROXY_TYPE}" = "socks5" ]; then
-# 对于 socks5 代理，使用 --socks5 选项
-if curl -s --socks5 "${PROXY_URL}" --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null | grep -qE '^(200|301|302)$'; then
+# 对于 socks5 代理，让代理端解析域名，避免轻量探测受本机 DNS 污染影响
+if curl -s --socks5-hostname "${PROXY_URL}" --connect-timeout 3 --max-time 5 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null | grep -qE '^(200|301|302)$'; then
 probe_result=0
 fi
 else
@@ -1039,26 +1047,85 @@ PM=""
 fi
 }
 
-# 函数名：check_go_version
-# 功能：检查 Go 版本是否满足要求（>= 1.23）
+# 从 PATH 和常见安装目录中选择版本最高的 Go，避免重复安装。
+select_best_go() {
+local -a candidates=()
+local candidate resolved output version
+local major minor patch
+local best_bin="" best_version="" best_major=-1 best_minor=-1 best_patch=-1
+local -A seen=()
+
+while IFS= read -r candidate; do
+[ -n "${candidate}" ] && candidates+=("${candidate}")
+done < <(type -aP go 2>/dev/null || true)
+
+shopt -s nullglob
+candidates+=(
+  /usr/local/go/bin/go
+  /usr/local/go*/bin/go
+  /usr/local/bin/go
+  /usr/bin/go
+  /bin/go
+  /opt/go*/bin/go
+  "${HOME}"/.local/go*/bin/go
+  "${HOME}"/.asdf/installs/golang/*/go/bin/go
+  "${HOME}"/.local/share/mise/installs/go/*/bin/go
+  "${HOME}"/.gvm/gos/*/bin/go
+)
+shopt -u nullglob
+
+for candidate in "${candidates[@]}"; do
+[ -x "${candidate}" ] || continue
+resolved="$(readlink -f "${candidate}" 2>/dev/null || printf '%s' "${candidate}")"
+[ -n "${seen[${resolved}]:-}" ] && continue
+seen["${resolved}"]=1
+
+output="$("${candidate}" version 2>/dev/null || true)"
+if [[ ! "${output}" =~ go([0-9]+)\.([0-9]+)(\.([0-9]+))? ]]; then
+continue
+fi
+major="${BASH_REMATCH[1]}"
+minor="${BASH_REMATCH[2]}"
+patch="${BASH_REMATCH[4]:-0}"
+version="${major}.${minor}.${patch}"
+
+if [ "${major}" -gt "${best_major}" ] || \
+   { [ "${major}" -eq "${best_major}" ] && [ "${minor}" -gt "${best_minor}" ]; } || \
+   { [ "${major}" -eq "${best_major}" ] && [ "${minor}" -eq "${best_minor}" ] && [ "${patch}" -gt "${best_patch}" ]; }; then
+best_bin="${resolved}"
+best_version="${version}"
+best_major="${major}"
+best_minor="${minor}"
+best_patch="${patch}"
+fi
+done
+
+[ -n "${best_bin}" ] || return 1
+
+GO_BIN="${best_bin}"
+GO_VERSION="${best_version}"
+export PATH="$(dirname "${GO_BIN}"):${PATH}"
+hash -r 2>/dev/null || true
+return 0
+}
+
+# 检查自动选择的 Go 是否满足要求（>= 1.23）。
 check_go_version() {
-if ! command -v go >/dev/null 2>&1; then
-# 缺 go 的情况交给依赖安装逻辑
-return
+local major minor
+
+if { [ -z "${GO_BIN}" ] || [ ! -x "${GO_BIN}" ]; } && ! select_best_go; then
+error "未找到可用的 Go，请安装 Go 1.23+ 后重试。"
 fi
 
-# go version 输出类似：go version go1.23.0 linux/amd64
-gv_raw="$(go version 2>/dev/null | awk '{print $3}')"
-gv="${gv_raw#go}"
-major="${gv%%.*}"
-rest="${gv#*.}"
-minor="${rest%%.*}"
+major="${GO_VERSION%%.*}"
+minor="${GO_VERSION#*.}"
+minor="${minor%%.*}"
 
 # 当前 graftcp 源码要求 Go >= 1.23，并在 Makefile 中强制 GOTOOLCHAIN=local。
 if [ "${major}" -lt 1 ] || { [ "${major}" -eq 1 ] && [ "${minor}" -lt 23 ]; }; then
 echo ""
 echo "============================================="
-echo " 检测到 Go 版本：${gv_raw}"
+echo " 检测到的最高 Go 版本：go${GO_VERSION}（${GO_BIN}）"
 echo "============================================="
 echo ""
 echo " 当前 graftcp 源码要求 Go >= 1.23。"
@@ -1078,7 +1145,11 @@ read -r -p "是否升级 Go 到最新版本？ [y/N]（默认 N，退出）: " u
 case "${upgrade_go}" in
 [Yy]*)
 upgrade_go_version
-gv_raw="$(go version 2>/dev/null | awk '{print $3}')"
+GO_BIN=""
+GO_VERSION=""
+if ! select_best_go; then
+error "Go 安装完成，但仍无法找到可执行文件。"
+fi
 ;;
 *)
 error "Go 版本过低（要求 >= 1.23），请升级 Go 后重试。"
@@ -1086,7 +1157,7 @@ error "Go 版本过低（要求 >= 1.23），请升级 Go 后重试。"
 esac
 fi
 
-log "Go 版本检查通过：${gv_raw}"
+log "Go 版本检查通过：go${GO_VERSION}（${GO_BIN}）"
 }
 
 # 升级 Go 到最新稳定版
@@ -1195,14 +1266,7 @@ ${UPGRADE_SUDO} tar -C /usr/local -xzf "${tmp_dir}/${go_tar}"
 
 # 更新 PATH，确保后续 make 使用刚安装的新版本 Go。
 export PATH="/usr/local/go/bin:${PATH}"
-log "已临时添加 /usr/local/go/bin 到 PATH"
-if ! grep -qs '^[[:space:]]*export PATH=/usr/local/go/bin:\$PATH' "${HOME}/.bashrc" "${HOME}/.profile" 2>/dev/null; then
-echo ""
-echo "⚠️ 提示：请将以下行添加到 ~/.bashrc 或 ~/.profile 以永久生效："
-echo "  export PATH=/usr/local/go/bin:\$PATH"
-echo "  然后执行 source ~/.bashrc 或 source ~/.profile 使配置生效"
-echo ""
-fi
+log "已在当前脚本进程中临时使用 /usr/local/go/bin（不会修改 shell 配置）"
 
 # 清理临时文件
 rm -f "${tmp_dir}/${go_tar}"
@@ -1214,28 +1278,52 @@ log "Go 升级完成：${new_version}"
 
 }
 
-# 函数名：ensure_dependencies
-# 功能：检查并安装编译 graftcp 所需的依赖（git, make, gcc, go, curl）
-# 错误处理：依赖安装失败时调用 error() 退出
+# 检查运行依赖；仅在尚无可用 graftcp 时检查编译依赖。
 ensure_dependencies() {
 detect_pkg_manager
 
-missing=()
-# 核心编译依赖
-for cmd in git make gcc go; do
-if ! command -v "${cmd}" >/dev/null 2>&1; then
-missing+=("${cmd}")
-fi
-done
+local -a missing=()
+local -a packages=()
+local -A package_seen=()
+local cmd package
+local need_build="1"
+local candidate_dir="${GRAFTCP_DIR:-${REPO_DIR}}"
+local detected_mode=""
 
-# 网络工具依赖
+if detect_graftcp_runtime "${candidate_dir}"; then
+need_build="0"
+detected_mode="${GRAFTCP_RUNTIME_MODE}"
+log "检测到可用的 graftcp，跳过 Go / GCC / Make 编译依赖检查。"
+fi
+
 if ! command -v curl >/dev/null 2>&1; then
 missing+=("curl")
 fi
 
+# 新版代理 DNS 的连通性验证需要 dig。
+if [ "${PROXY_DNS_ENABLED}" = "1" ] && \
+   { [ "${need_build}" = "1" ] || [ "${detected_mode}" = "merged" ]; } && \
+   ! command -v dig >/dev/null 2>&1; then
+missing+=("dig")
+fi
+
+if [ "${need_build}" = "1" ]; then
+for cmd in git make gcc; do
+if ! command -v "${cmd}" >/dev/null 2>&1; then
+missing+=("${cmd}")
+fi
+done
+if ! select_best_go; then
+missing+=("go")
+fi
+fi
+
 if [ "${#missing[@]}" -eq 0 ]; then
-log "依赖已满足：git / make / gcc / go / curl"
+if [ "${need_build}" = "1" ]; then
 check_go_version
+else
+log "运行依赖已满足。"
+fi
 return
 fi
 
@@ -1253,7 +1341,23 @@ else
 SUDO=""
 fi
 
-log "缺少依赖：${missing[*]}，使用 ${PM} 自动安装..."
+for cmd in "${missing[@]}"; do
+case "${PM}:${cmd}" in
+apt:go) package="golang-go" ;;
+apt:dig) package="dnsutils" ;;
+dnf:go|yum:go) package="golang" ;;
+dnf:dig|yum:dig) package="bind-utils" ;;
+pacman:dig) package="bind" ;;
+zypper:dig) package="bind-utils" ;;
+*) package="${cmd}" ;;
+esac
+if [ -z "${package_seen[${package}]:-}" ]; then
+packages+=("${package}")
+package_seen["${package}"]=1
+fi
+done
+
+log "缺少依赖：${missing[*]}，使用 ${PM} 安装：${packages[*]}"
 
 # 声明 install_result 变量（在 case 之前声明，避免 local 重置 PIPESTATUS）
 local install_result=0
@@ -1262,62 +1366,28 @@ local pipestatus_arr
 case "${PM}" in
 apt)
 ${SUDO} apt-get update | tee -a "${INSTALL_LOG}"
-# 安装核心编译依赖 + curl + procps（pgrep/pkill）+ 可选的 net-tools（netstat）
-${SUDO} apt-get install -y git make gcc golang-go curl procps net-tools 2>&1 | tee -a "${INSTALL_LOG}"
-pipestatus_arr=("${PIPESTATUS[@]}")
-install_result="${pipestatus_arr[0]}"
-if [ "${install_result}" -ne 0 ]; then
-# 回退到不包含 net-tools 的版本
-${SUDO} apt-get install -y git make gcc golang-go curl procps 2>&1 | tee -a "${INSTALL_LOG}"
-pipestatus_arr=("${PIPESTATUS[@]}")
-install_result="${pipestatus_arr[0]}"
-fi
+${SUDO} apt-get install -y "${packages[@]}" 2>&1 | tee -a "${INSTALL_LOG}"
 ;;
 dnf)
-${SUDO} dnf install -y git make gcc golang curl procps-ng net-tools 2>&1 | tee -a "${INSTALL_LOG}"
-pipestatus_arr=("${PIPESTATUS[@]}")
-install_result="${pipestatus_arr[0]}"
-if [ "${install_result}" -ne 0 ]; then
-${SUDO} dnf install -y git make gcc golang curl procps-ng 2>&1 | tee -a "${INSTALL_LOG}"
-pipestatus_arr=("${PIPESTATUS[@]}")
-install_result="${pipestatus_arr[0]}"
-fi
+${SUDO} dnf install -y "${packages[@]}" 2>&1 | tee -a "${INSTALL_LOG}"
 ;;
 yum)
-${SUDO} yum install -y git make gcc golang curl procps-ng net-tools 2>&1 | tee -a "${INSTALL_LOG}"
-pipestatus_arr=("${PIPESTATUS[@]}")
-install_result="${pipestatus_arr[0]}"
-if [ "${install_result}" -ne 0 ]; then
-${SUDO} yum install -y git make gcc golang curl procps-ng 2>&1 | tee -a "${INSTALL_LOG}"
-pipestatus_arr=("${PIPESTATUS[@]}")
-install_result="${pipestatus_arr[0]}"
-fi
+${SUDO} yum install -y "${packages[@]}" 2>&1 | tee -a "${INSTALL_LOG}"
 ;;
 pacman)
-${SUDO} pacman -Sy --noconfirm git base-devel go curl procps-ng net-tools 2>&1 | tee -a "${INSTALL_LOG}"
-pipestatus_arr=("${PIPESTATUS[@]}")
-install_result="${pipestatus_arr[0]}"
-if [ "${install_result}" -ne 0 ]; then
-${SUDO} pacman -Sy --noconfirm git base-devel go curl procps-ng 2>&1 | tee -a "${INSTALL_LOG}"
-pipestatus_arr=("${PIPESTATUS[@]}")
-install_result="${pipestatus_arr[0]}"
-fi
+${SUDO} pacman -Sy --noconfirm "${packages[@]}" 2>&1 | tee -a "${INSTALL_LOG}"
 ;;
 zypper)
 ${SUDO} zypper refresh | tee -a "${INSTALL_LOG}"
-${SUDO} zypper install -y git make gcc go curl procps net-tools 2>&1 | tee -a "${INSTALL_LOG}"
-pipestatus_arr=("${PIPESTATUS[@]}")
-install_result="${pipestatus_arr[0]}"
-if [ "${install_result}" -ne 0 ]; then
-${SUDO} zypper install -y git make gcc go curl procps 2>&1 | tee -a "${INSTALL_LOG}"
-pipestatus_arr=("${PIPESTATUS[@]}")
-install_result="${pipestatus_arr[0]}"
-fi
+${SUDO} zypper install -y "${packages[@]}" 2>&1 | tee -a "${INSTALL_LOG}"
 ;;
 *)
 error "暂不支持使用 ${PM} 自动安装依赖，请手动安装：${missing[*]}"
 ;;
 esac
+
+pipestatus_arr=("${PIPESTATUS[@]}")
+install_result="${pipestatus_arr[0]}"
 
 # 验证安装是否成功
 if [ "${install_result:-1}" -ne 0 ]; then
@@ -1331,8 +1401,10 @@ echo "详细日志：${INSTALL_LOG}"
 error "依赖安装失败"
 fi
 
+if [ "${need_build}" = "1" ]; then
 check_go_version
-log "依赖安装完成。"
+fi
+log "所需依赖安装完成。"
 }
 
 ################################ 安装 / 编译 graftcp ################################
@@ -2090,6 +2162,8 @@ PROXY_URL="${PROXY_URL}"
 PROXY_TYPE="${PROXY_TYPE}"
 GRAFTCP_LOCAL_PORT="${GRAFTCP_LOCAL_PORT}"
 GRAFTCP_PIPE_PATH="${GRAFTCP_PIPE_PATH}"
+ANTISSH_PROXY_DNS="\${ANTISSH_PROXY_DNS:-${PROXY_DNS_ENABLED}}"
+ANTISSH_DNS_SERVER="\${ANTISSH_DNS_SERVER:-${GRAFTCP_DNS_SERVER}}"
 ANTISSH_FORCE_SYSTEM_DNS="\${ANTISSH_FORCE_SYSTEM_DNS:-${FORCE_SYSTEM_DNS}}"
 LOG_FILE="\$HOME/.graftcp-antigravity/wrapper.log"
 
@@ -2121,17 +2195,21 @@ if [ "\$GRAFTCP_RUNTIME_MODE" = "legacy" ]; then
 fi
 
 # 设置 GODEBUG，保留用户原有值并追加所需配置
-# 1. 可选：强制使用系统 DNS（默认开启，可用 ANTISSH_FORCE_SYSTEM_DNS=0 关闭）
-# 2. 关闭 HTTP/2 客户端 (解决 EOF 等问题)
-# 3. 关闭 TLS 1.3 (避免部分环境握手问题)
+# 1. 默认强制使用 Go 内置 DNS，让 graftcp 能拦截当前进程的 UDP/53 查询
+# 2. 可用 ANTISSH_PROXY_DNS=0 回退到系统 DNS
+# 3. 关闭 HTTP/2 客户端 (解决 EOF 等问题)
+# 4. 关闭 TLS 1.3 (避免部分环境握手问题)
 DNS_FORCE="\${ANTISSH_FORCE_SYSTEM_DNS:-1}"
 DNS_GODEBUG=""
-case "\${DNS_FORCE}" in
+case "\${ANTISSH_PROXY_DNS}" in
   0|false|FALSE|no|NO|off|OFF)
-    DNS_GODEBUG=""
+    case "\${DNS_FORCE}" in
+      0|false|FALSE|no|NO|off|OFF) DNS_GODEBUG="" ;;
+      *) DNS_GODEBUG="netdns=cgo" ;;
+    esac
     ;;
   *)
-    DNS_GODEBUG="netdns=cgo"
+    DNS_GODEBUG="netdns=go"
     ;;
 esac
 
@@ -2148,10 +2226,15 @@ fi
 
 # 通过 graftcp 启动原始二进制，并清除代理相关环境变量，避免递归代理/死循环
 if [ "\$GRAFTCP_RUNTIME_MODE" = "merged" ]; then
+  GRAFTCP_DNS_ARGS=()
+  case "\${ANTISSH_PROXY_DNS}" in
+    0|false|FALSE|no|NO|off|OFF) ;;
+    *) GRAFTCP_DNS_ARGS=(--enable-dns "--dns-server=\$ANTISSH_DNS_SERVER") ;;
+  esac
   if [ "\$PROXY_TYPE" = "http" ]; then
-    exec "\$GRAFTCP_BIN" --http_proxy="\$PROXY_URL" --select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
+    exec "\$GRAFTCP_BIN" "\${GRAFTCP_DNS_ARGS[@]}" --http_proxy="\$PROXY_URL" --select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
   else
-    exec "\$GRAFTCP_BIN" --socks5="\$PROXY_URL" --select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
+    exec "\$GRAFTCP_BIN" "\${GRAFTCP_DNS_ARGS[@]}" --socks5="\$PROXY_URL" --select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
   fi
 else
   exec "\$GRAFTCP_BIN" -p "\$GRAFTCP_LOCAL_PORT" -f "\$GRAFTCP_PIPE_PATH" env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy "\$0.bak" "\$@"
@@ -2315,6 +2398,37 @@ log "使用 graftcp v0.8+ 单二进制模式进行测试..."
 local http_code="000"
 local retry_count=0
 local max_retries=3
+local resolved_ip=""
+local dns_host="${GRAFTCP_DNS_SERVER%:*}"
+local dns_port="${GRAFTCP_DNS_SERVER##*:}"
+local -a graftcp_test_args=()
+local -a curl_resolve_args=()
+
+if [ "${PROXY_TYPE}" = "http" ]; then
+graftcp_test_args=(--http_proxy="${PROXY_URL}" --select_proxy_mode=only_http_proxy)
+else
+graftcp_test_args=(--socks5="${PROXY_URL}" --select_proxy_mode=only_socks5)
+fi
+
+if [ "${PROXY_DNS_ENABLED}" = "1" ]; then
+graftcp_test_args+=(--enable-dns --dns-server="${GRAFTCP_DNS_SERVER}")
+log "测试进程级代理 DNS（上游 ${GRAFTCP_DNS_SERVER}）..."
+if command -v dig >/dev/null 2>&1; then
+resolved_ip=$("${GRAFTCP_BIN}" "${graftcp_test_args[@]}" \
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+dig +time=8 +tries=1 +short "@${dns_host}" -p "${dns_port}" www.google.com A 2>/dev/null | \
+awk '/^([0-9]{1,3}[.]){3}[0-9]{1,3}$/{print; exit}')
+else
+warn "未找到 dig，无法验证进程级代理 DNS；请安装 dnsutils/bind-utils 后重试。"
+fi
+
+if [ -n "${resolved_ip}" ]; then
+log "进程级代理 DNS 测试成功：www.google.com -> ${resolved_ip}"
+curl_resolve_args=(--resolve "www.google.com:443:${resolved_ip}")
+else
+warn "进程级代理 DNS 测试失败，无法获得 www.google.com 的有效 IPv4 地址。"
+fi
+fi
 
 while [ "${retry_count}" -lt "${max_retries}" ]; do
 retry_count=$((retry_count + 1))
@@ -2324,10 +2438,14 @@ log "第 ${retry_count} 次尝试测试代理..."
 sleep 1
 fi
 
-if [ "${PROXY_TYPE}" = "http" ]; then
-http_code=$("${GRAFTCP_BIN}" --http_proxy="${PROXY_URL}" --select_proxy_mode=only_http_proxy env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000")
+if [ "${PROXY_DNS_ENABLED}" = "1" ] && [ -z "${resolved_ip}" ]; then
+http_code="000"
 else
-http_code=$("${GRAFTCP_BIN}" --socks5="${PROXY_URL}" --select_proxy_mode=only_socks5 env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy curl -s --connect-timeout 10 --max-time 15 -o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || echo "000")
+http_code=$("${GRAFTCP_BIN}" "${graftcp_test_args[@]}" \
+env -u HTTP_PROXY -u HTTPS_PROXY -u ALL_PROXY -u http_proxy -u https_proxy -u all_proxy \
+curl -s --connect-timeout 10 --max-time 15 "${curl_resolve_args[@]}" \
+-o /dev/null -w "%{http_code}" "https://www.google.com" 2>/dev/null || true)
+[ -n "${http_code}" ] || http_code="000"
 fi
 
 if [ "${http_code}" = "200" ] || [ "${http_code}" = "301" ] || [ "${http_code}" = "302" ]; then
@@ -2627,6 +2745,11 @@ main() {
   ensure_dependencies
   install_graftcp
   if [ "${GRAFTCP_RUNTIME_MODE}" = "legacy" ]; then
+    if [ "${PROXY_DNS_ENABLED}" = "1" ]; then
+      warn "graftcp v0.7 legacy 模式不支持当前进程级代理 DNS，回退到服务器系统 DNS。"
+      PROXY_DNS_ENABLED="0"
+      FORCE_SYSTEM_DNS="1"
+    fi
     ask_graftcp_port
   else
     log "当前 graftcp 为 v0.8+ 单二进制模式，无需配置 graftcp-local 端口。"
@@ -2702,7 +2825,8 @@ main() {
   echo "如需切换 DNS 策略："
   echo "  1. 重新运行本脚本，在“DNS 解析策略”中选择。"
   echo "  2. 或手动编辑上面列出的 wrapper 文件，"
-  echo "     将 ANTISSH_FORCE_SYSTEM_DNS 设置为 1（强制）或 0（不强制）。"
+  echo "     将 ANTISSH_PROXY_DNS 设置为 1（进程级代理 DNS）或 0（系统 DNS）。"
+  echo "     代理 DNS 上游可通过 ANTISSH_DNS_SERVER 修改，默认 ${GRAFTCP_DNS_SERVER}。"
   echo
   echo "如需完全恢复原始行为（对每个文件分别执行）："
   for target in "${all_targets[@]}"; do
