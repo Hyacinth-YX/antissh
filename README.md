@@ -9,10 +9,12 @@
 - **避免重复安装 Go**：从 PATH、`/usr/local`、`/usr`、`/opt` 及 asdf/mise/gvm 常见目录中选择最高版本，仅在脚本进程内临时调整 PATH，不修改 `.bashrc`；已有可用 graftcp 时跳过编译依赖检查。
 - **兼容旧版**：graftcp v0.7 legacy 模式不支持代理 DNS，会自动回退到系统 DNS。
 
-运行方式与原版相同：
+下载并运行：
 
 ```bash
-bash ./antissh.sh
+curl -fLO https://raw.githubusercontent.com/Hyacinth-YX/antissh/main/antissh.sh
+chmod +x antissh.sh
+./antissh.sh
 ```
 
 生成 wrapper 后，可通过 `ANTISSH_PROXY_DNS=0` 使用系统 DNS，或通过 `ANTISSH_DNS_SERVER=1.1.1.1:53` 更换上游。代理 DNS 要求 graftcp 支持 `--enable-dns` 和 `--dns-server`。
@@ -47,9 +49,7 @@ bash ./antissh.sh
 ### 1. 下载脚本
 
 ```bash
-curl -O https://raw.githubusercontent.com/ccpopy/antissh/main/antissh.sh
-# 或者国内加速下载
-# curl -O https://ghproxy.net/https://raw.githubusercontent.com/ccpopy/antissh/main/antissh.sh
+curl -fLO https://raw.githubusercontent.com/Hyacinth-YX/antissh/main/antissh.sh
 chmod +x antissh.sh
 ```
 
@@ -335,9 +335,7 @@ IDE 一般会在远程连接时下载一个 server 目录（1.x 为 `.antigravit
 ### 下载脚本
 
 ```bash
-curl -O https://raw.githubusercontent.com/ccpopy/antissh/main/installAntigravity.sh
-# 或者国内加速下载
-# curl -O https://ghproxy.net/https://raw.githubusercontent.com/ccpopy/antissh/main/installAntigravity.sh
+curl -fLO https://raw.githubusercontent.com/Hyacinth-YX/antissh/main/installAntigravity.sh
 chmod +x installAntigravity.sh
 ```
 
