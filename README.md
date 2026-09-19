@@ -17,6 +17,8 @@ bash ./antissh.sh
 
 生成 wrapper 后，可通过 `ANTISSH_PROXY_DNS=0` 使用系统 DNS，或通过 `ANTISSH_DNS_SERVER=1.1.1.1:53` 更换上游。代理 DNS 要求 graftcp 支持 `--enable-dns` 和 `--dns-server`。
 
+手动输入代理时，协议前缀必须与端口实际能力一致；混合端口同时支持 SOCKS5/HTTP 时优先填写 `socks5://`，仅支持 HTTP 时才填写 `http://`。
+
 ---
 
 ## 原项目 README
